@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+set +x
+umask 077
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -28,6 +30,8 @@ DEFAULT_RELEASE_VERSION="latest"
 DEFAULT_LOG_LEVEL="info"
 DEFAULT_KERNEL_LOG_LEVEL="warn"
 DEFAULT_DOWNLOAD_BASE="https://github.com/cedar2025/xboard-node/releases"
+NEZHA_INSTALL_URL="https://raw.githubusercontent.com/nezhahq/scripts/26b81c4ad221ee2356a71f7d7563e68550b2e7a3/agent/install.sh"
+NEZHA_INSTALL_SHA256="44d5afa933383f651ec0924c3ac81ffa968b96fbea5484a7cfeea89bac5bf000"
 
 ACTION="${DEFAULT_ACTION}"
 MODE=""
@@ -36,6 +40,7 @@ TOKEN=""
 NODE_ID=""
 NODE_TYPE=""
 MACHINE_ID=""
+INSTALL_NEZHA=0
 KERNEL_TYPE="${DEFAULT_KERNEL}"
 RELEASE_VERSION="${DEFAULT_RELEASE_VERSION}"
 HEALTH_PORT="${DEFAULT_HEALTH_PORT}"
@@ -182,6 +187,7 @@ usage() {
     --panel, -a       Panel URL
     --token, -t       Machine token
     --machine-id      Machine ID
+    --install-nezha    Install Nezha Agent after xboard-node succeeds (machine mode)
 
   OPTIONAL:
     --node-type, -T     Explicit node type for node mode
@@ -236,6 +242,10 @@ parse_args() {
             --machine-id)
                 MACHINE_ID="$2"
                 shift 2
+                ;;
+            --install-nezha)
+                INSTALL_NEZHA=1
+                shift
                 ;;
             --kernel|-k)
                 KERNEL_TYPE="$2"
@@ -315,6 +325,10 @@ parse_args() {
             exit 1
             ;;
     esac
+    if [ "$INSTALL_NEZHA" -eq 1 ] && [ "$MODE" != "machine" ]; then
+        log_error "--install-nezha requires machine mode"
+        exit 1
+    fi
 }
 
 check_root() {
@@ -702,6 +716,152 @@ start_service() {
     fi
 }
 
+# The pinned official script assembles NZ_CLIENT_SECRET into an `env ...` command
+# and runs it through eval. Patch that verified script locally before execution so
+# the secret is inherited as environment data and never appears in process argv.
+install_nezha_agent() {
+    if [ -f /opt/nezha/agent/config.yml ] || [ -e /opt/nezha/agent/nezha-agent ] ||
+       [ -e /etc/systemd/system/nezha-agent.service ]; then
+        log_info "Existing Nezha installation detected; leaving it untouched"
+        return 0
+    fi
+
+    if ! [[ "$PANEL_URL" =~ ^https://[^/?#@]+/?$ ]]; then
+        log_warn "Nezha configuration requires an HTTPS panel URL"
+        return 1
+    fi
+
+    if ! command -v python3 >/dev/null 2>&1 || ! command -v unzip >/dev/null 2>&1; then
+        case "$OS" in
+            ubuntu|debian)
+                DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 unzip >/dev/null 2>&1 || return 1 ;;
+            centos|rhel|rocky|almalinux|fedora)
+                if command -v dnf >/dev/null 2>&1; then
+                    dnf install -y -q python3 unzip >/dev/null 2>&1 || return 1
+                else
+                    yum install -y -q python3 unzip >/dev/null 2>&1 || return 1
+                fi ;;
+            *) return 1 ;;
+        esac
+    fi
+
+    local nezha_dir request_file response_file values_file official_file patched_file
+    local -a values=()
+    nezha_dir=$(mktemp -d "${TMP_DIR}/nezha.XXXXXX") || return 1
+    chmod 700 "$nezha_dir" || return 1
+    request_file="$nezha_dir/request.json"
+    response_file="$nezha_dir/response.json"
+    values_file="$nezha_dir/values"
+    official_file="$nezha_dir/official.sh"
+    patched_file="$nezha_dir/install.sh"
+
+    if ! TOKEN="$TOKEN" MACHINE_ID="$MACHINE_ID" python3 -c \
+        'import json, os; print(json.dumps({"machine_id": int(os.environ["MACHINE_ID"]), "token": os.environ["TOKEN"]}))' \
+        > "$request_file"; then
+        return 1
+    fi
+    chmod 600 "$request_file"
+    if ! curl -fsS --proto '=https' --proto-redir '=https' --max-redirs 0 \
+        --tlsv1.2 --max-time 20 -H 'Content-Type: application/json' \
+        --data-binary "@$request_file" -o "$response_file" \
+        "${PANEL_URL%/}/api/v2/server/machine/nezha-config" >/dev/null 2>&1; then
+        return 1
+    fi
+    chmod 600 "$response_file"
+
+    if ! python3 - "$response_file" "$values_file" <<'PY_NEZHA_JSON'
+import json
+import re
+import sys
+
+try:
+    with open(sys.argv[1], encoding='utf-8') as stream:
+        data = json.load(stream)
+    if type(data) is not dict or type(data.get('enabled')) is not bool:
+        raise ValueError('invalid response')
+    if data['enabled'] is False:
+        values = ('disabled',)
+    else:
+        server, tls, secret = data.get('server'), data.get('tls'), data.get('client_secret')
+        if (type(server) is not str or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.:-]*:[0-9]{1,5}', server)
+                or not 1 <= int(server.rsplit(':', 1)[1]) <= 65535
+                or type(tls) is not bool or type(secret) is not str
+                or not re.fullmatch(r'[A-Za-z0-9_-]{16,256}', secret)):
+            raise ValueError('invalid response')
+        values = ('enabled', server, 'true' if tls else 'false', secret)
+    with open(sys.argv[2], 'wb') as stream:
+        stream.write(b'\0'.join(value.encode() for value in values) + b'\0')
+except (OSError, ValueError, UnicodeError, json.JSONDecodeError):
+    sys.exit(1)
+PY_NEZHA_JSON
+    then
+        return 1
+    fi
+    chmod 600 "$values_file"
+    mapfile -d '' -t values < "$values_file"
+    rm -f "$request_file" "$response_file" "$values_file"
+    if [ "${values[0]:-}" = "disabled" ]; then
+        log_info "Nezha deployment is disabled on the panel"
+        return 0
+    fi
+    if [ "${#values[@]}" -ne 4 ]; then
+        return 1
+    fi
+
+    if ! curl -fsS --proto '=https' --proto-redir '=https' --max-redirs 0 \
+        --tlsv1.2 --max-time 30 "$NEZHA_INSTALL_URL" -o "$official_file" >/dev/null 2>&1; then
+        return 1
+    fi
+    if ! printf '%s  %s\n' "$NEZHA_INSTALL_SHA256" "$official_file" | sha256sum -c - >/dev/null 2>&1; then
+        return 1
+    fi
+
+    if ! python3 - "$official_file" "$patched_file" <<'PY_NEZHA_PATCH'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_text()
+start = source.index('    if command -v wget >/dev/null 2>&1; then\n')
+end = source.index('    sudo mkdir -p $NZ_AGENT_PATH\n', start)
+source = source[:start] + '''    if ! curl --max-time 60 -fsSL "$NZ_AGENT_URL" -o "$NZ_WORK_DIR/nezha-agent_${os}_${os_arch}.zip"; then
+        err "Download nezha-agent release failed"
+        exit 1
+    fi
+
+''' + source[end:]
+source = source.replace('/tmp/nezha-agent_${os}_${os_arch}.zip', '${NZ_WORK_DIR}/nezha-agent_${os}_${os_arch}.zip')
+start = source.index('    env="NZ_UUID=')
+end = source.index('    success "nezha-agent successfully installed"', start)
+source = source[:start] + '''    if ! "${NZ_AGENT_PATH}/nezha-agent" service -c "$path" install >/dev/null 2>&1; then
+        err "Install nezha-agent service failed"
+        exit 1
+    fi
+
+''' + source[end:]
+Path(sys.argv[2]).write_text(source)
+PY_NEZHA_PATCH
+    then
+        return 1
+    fi
+    chmod 700 "$patched_file"
+
+    local NZ_SERVER="${values[1]}" NZ_TLS="${values[2]}" NZ_CLIENT_SECRET="${values[3]}"
+    local NZ_WORK_DIR="$nezha_dir"
+    if ! export NZ_SERVER NZ_TLS NZ_CLIENT_SECRET NZ_WORK_DIR; then
+        return 1
+    fi
+    if ! sh "$patched_file" >/dev/null 2>&1; then
+        unset NZ_CLIENT_SECRET NZ_SERVER NZ_TLS NZ_WORK_DIR
+        return 1
+    fi
+    unset NZ_CLIENT_SECRET NZ_SERVER NZ_TLS NZ_WORK_DIR
+    if [ -f /opt/nezha/agent/config.yml ]; then
+        chmod 600 /opt/nezha/agent/config.yml || return 1
+    fi
+    systemctl enable --now nezha-agent.service >/dev/null 2>&1 || return 1
+    systemctl is-active nezha-agent.service >/dev/null 2>&1
+}
+
 perform_install() {
     validate_install_request
     detect_current_state
@@ -724,6 +884,13 @@ perform_install() {
         log_info "Health: http://127.0.0.1:${HEALTH_PORT}/healthz"
     fi
     log_info "CLI: ${CLI_PATH}  (run '${CLI_PATH} list' if xbctl is not in PATH)"
+    if [ "$INSTALL_NEZHA" -eq 1 ]; then
+        if install_nezha_agent; then
+            log_info "Nezha deployment step finished"
+        else
+            log_warn "Nezha Agent setup failed; xboard-node remains running"
+        fi
+    fi
 }
 
 perform_upgrade() {
