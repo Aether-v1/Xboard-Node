@@ -13,7 +13,7 @@ git -C /tmp/nezha-scripts-ref checkout 26b81c4ad221ee2356a71f7d7563e68550b2e7a3
 From the Xboard-Node repository, run in a Linux environment with Docker:
 
 ```sh
-for case in normal disabled repeat malformed fetch_failed agent_failed \
+for case in normal disabled repeat orphaned_binary malformed fetch_failed agent_failed \
   node_survives_agent_failure node_survives_config_failure upgrade_uninstall; do
   docker run --rm -v "$PWD:/src:ro" \
     -v /tmp/nezha-scripts-ref:/official:ro python:3.12-slim \

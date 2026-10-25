@@ -720,7 +720,9 @@ start_service() {
 # and runs it through eval. Patch that verified script locally before execution so
 # the secret is inherited as environment data and never appears in process argv.
 install_nezha_agent() {
-    if [ -f /opt/nezha/agent/config.yml ] || [ -e /opt/nezha/agent/nezha-agent ] ||
+    # The official uninstaller leaves the binary behind. A binary without
+    # configuration or a service unit is not an active installation.
+    if [ -f /opt/nezha/agent/config.yml ] ||
        [ -e /etc/systemd/system/nezha-agent.service ]; then
         log_info "Existing Nezha installation detected; leaving it untouched"
         return 0

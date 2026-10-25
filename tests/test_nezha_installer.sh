@@ -57,7 +57,7 @@ MACHINE_ID=7
 TOKEN='test-machine-token'
 
 case "$case_name" in
-    normal|repeat|agent_failed|node_survives_agent_failure|node_survives_config_failure|upgrade_uninstall)
+    normal|repeat|orphaned_binary|agent_failed|node_survives_agent_failure|node_survives_config_failure|upgrade_uninstall)
         printf '%s' '{"enabled":true,"server":"monitor.example:8008","tls":false,"client_secret":"test-secret-only-1234"}' > "$MOCK_RESPONSE" ;;
     disabled)
         printf '%s' '{"enabled":false}' > "$MOCK_RESPONSE" ;;
@@ -71,6 +71,11 @@ esac
 if [ "$case_name" = node_survives_config_failure ]; then export MOCK_FAIL_CONFIG=1; fi
 if [[ "$case_name" == agent_failed || "$case_name" == node_survives_agent_failure ]]; then
     export MOCK_FAIL_AGENT=1
+fi
+
+if [ "$case_name" = orphaned_binary ]; then
+    mkdir -p /opt/nezha/agent
+    printf 'left by official uninstall' > /opt/nezha/agent/nezha-agent
 fi
 
 if [[ "$case_name" == normal || "$case_name" == disabled || "$case_name" == node_survives_agent_failure || "$case_name" == node_survives_config_failure ]]; then
@@ -121,7 +126,7 @@ else
     [ "$(cat "$MOCK_AGENT_COUNT")" = 1 ]
 fi
 
-if [[ "$case_name" == normal || "$case_name" == repeat ]]; then
+if [[ "$case_name" == normal || "$case_name" == repeat || "$case_name" == orphaned_binary ]]; then
     [ "$(cat "$MOCK_AGENT_COUNT")" = 1 ]
     [ "$(cat /opt/nezha/agent/config.yml)" = "$TEST_SECRET" ]
     [ "$(stat -c %a /opt/nezha/agent/config.yml)" = 600 ]
